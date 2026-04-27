@@ -1,18 +1,27 @@
 --[[
     FlightDataRecorder.lua  —  FlyWithLua NG for X-Plane 12
-    Comprehensive flight + systems snapshot with adaptive sampling rate.
-    - Normal phase  : 1 snapshot every 2 s  (0.5 Hz)
-    - Critical phase: 4 snapshots per second (4 Hz)
-      Trigger: radio altitude < 300 ft  AND  IAS > 40 kts
-      (covers takeoff roll, climb-out, approach, landing, go-around)
+    Comprehensive flight + systems snapshot with Dynamic Sampling Rate (DSR).
+
+    DSR engine: 3-dimensional urgency score (0–100) → 7-step sampling rate.
+      Dim 1 – Flight Phase  (max 40 pts): state machine from cold-dark to flare
+      Dim 2 – Dynamics      (max 35 pts): pitch/roll rate, G-force deviation
+      Dim 3 – Alerts        (max 25 pts): fire/master-warning/stall/GPWS/windshear
+
+    Score → Interval map:
+       0–10  → 10.0 s  (0.10 Hz)  cold-dark / parked
+      11–20  →  5.0 s  (0.20 Hz)  engine start / idle
+      21–35  →  2.0 s  (0.50 Hz)  cruise
+      36–50  →  1.0 s  (1.0  Hz)  climb / descent
+      51–65  →  0.5 s  (2.0  Hz)  approach / low altitude
+      66–80  →  0.2 s  (5.0  Hz)  very low / aggressive maneuver
+      81+    →  0.1 s  (10.0 Hz)  max urgency (flare, TO roll, alerts)
+
     Covers cold-start sequence: electrical, APU, engine start,
     fuel, anti-ice, pressurization, hydraulics, EFIS, switches.
     Output: X-Plane 12/Output/flight_recorder/flight_YYYYMMDD_HHMMSS.jsonl
 --]]
 
-local INTERVAL_NORMAL   = 2.0   -- seconds between snapshots in normal flight
-local INTERVAL_CRITICAL = 0.25  -- seconds between snapshots in critical phase (4 Hz)
-local last_write_time   = 0.0   -- uses TOTAL_RUNNING_TIME_SEC (float, high-res)
+local last_write_time = 0.0   -- TOTAL_RUNNING_TIME_SEC (float, high-res)
 
 local output_dir   = SYSTEM_DIRECTORY .. "Output/flight_recorder/"
 os.execute('mkdir -p "' .. output_dir .. '"')
@@ -421,19 +430,110 @@ local function json(v)
 end
 
 -- ================================================================
+-- Dynamic Sampling Rate (DSR) Engine
+-- ================================================================
+
+-- Dim 1 – Flight Phase (max 40 pts)
+-- Dim 2 – Dynamics: pitch/roll rate, G-force deviation (max 35 pts)
+-- Dim 3 – Alerts: fire, master-warning, stall, GPWS, windshear (max 25 pts)
+local function urgency_score()
+    local score = 0
+    local gs_kts = fdr_gs_ms * 1.944   -- m/s → knots
+
+    -- ── Dimension 1: Flight Phase ─────────────────────────────────
+    if fdr_on_ground == 1 then
+        if gs_kts < 2 then
+            -- Parked: cold-dark (0 pts) vs engines running (6 pts)
+            local n1_avg = (fdr_n1_0 + fdr_n1_1) * 0.5
+            score = score + (n1_avg < 20 and 0 or 6)
+        elseif gs_kts < 30 then
+            score = score + 12      -- taxi
+        else
+            score = score + 38      -- takeoff roll / high-speed abort
+        end
+    else
+        local ra = fdr_ra_ft
+        if    ra <   50 then score = score + 40  -- flare / just airborne
+        elseif ra <  200 then score = score + 36  -- very low final / climb-out
+        elseif ra <  500 then score = score + 30  -- low altitude
+        elseif ra < 1000 then
+            -- Approach with flaps out is more urgent than clean climb
+            score = score + (fdr_flap_actual > 0.1 and 30 or 24)
+        elseif ra < 3000 then score = score + 20  -- terminal area
+        else                  score = score + 10  -- cruise / high altitude
+        end
+    end
+
+    -- ── Dimension 2: Dynamics ─────────────────────────────────────
+    -- P / Q (rad/s from flight model) → deg/s
+    local pr  = math.abs(fdr_pitch_rate) * 57.3
+    local rr  = math.abs(fdr_roll_rate)  * 57.3
+    local dyn = 0
+
+    if    pr > 5  then dyn = dyn + 15
+    elseif pr > 2  then dyn = dyn + 10
+    elseif pr > 0.5 then dyn = dyn + 5
+    end
+
+    if    rr > 8 then dyn = dyn + 10
+    elseif rr > 3 then dyn = dyn + 6
+    elseif rr > 1 then dyn = dyn + 3
+    end
+
+    local gn_dev = math.abs(fdr_g_normal - 1.0)
+    if    gn_dev > 0.5 then dyn = dyn + 10
+    elseif gn_dev > 0.2 then dyn = dyn + 7
+    elseif gn_dev > 0.1 then dyn = dyn + 4
+    end
+
+    local gl = math.abs(fdr_g_lat)
+    if    gl > 0.2 then dyn = dyn + 5
+    elseif gl > 0.1 then dyn = dyn + 3
+    end
+
+    score = score + math.min(dyn, 35)
+
+    -- ── Dimension 3: Alerts ───────────────────────────────────────
+    local alrt = 0
+    if fdr_master_wrn == 1               then alrt = alrt + 25 end
+    if fdr_efi0 == 1 or fdr_efi1 == 1   then alrt = alrt + 25 end
+    if fdr_stall == 1                    then alrt = alrt + 20 end
+    if fdr_gpws  == 1                    then alrt = alrt + 20 end
+    if     fdr_ws_warn >= 3              then alrt = alrt + 20
+    elseif fdr_ws_warn >= 1              then alrt = alrt + 10 end
+    if fdr_master_ctn == 1               then alrt = alrt + 8  end
+    score = score + math.min(alrt, 25)
+
+    return math.min(score, 100)
+end
+
+-- Score 0-100 → sampling interval in seconds (max 10 Hz, min 0.1 Hz)
+local function score_to_interval(s)
+    if     s <= 10 then return 10.0
+    elseif s <= 20 then return  5.0
+    elseif s <= 35 then return  2.0
+    elseif s <= 50 then return  1.0
+    elseif s <= 65 then return  0.5
+    elseif s <= 80 then return  0.2
+    else                return  0.1
+    end
+end
+
+-- ================================================================
 -- Snapshot builder
 -- ================================================================
-local function build_snapshot(now, in_critical)
+local function build_snapshot(now, urgency, interval_used)
     return {
-        timestamp_unix  = now,
-        timestamp_iso   = os.date("!%Y-%m-%dT%H:%M:%SZ", now),
-        sim_time_sec    = fdr_sim_time,
-        zulu_sec        = fdr_zulu_sec,
-        paused          = bool(fdr_paused),
-        aircraft        = AIRCRAFT_FILENAME,
-        -- Adaptive sampling metadata
-        phase           = in_critical and "critical" or "normal",
-        sample_rate_hz  = in_critical and 4 or 0.5,
+        timestamp_unix     = now,
+        timestamp_iso      = os.date("!%Y-%m-%dT%H:%M:%SZ", now),
+        sim_time_sec       = fdr_sim_time,
+        zulu_sec           = fdr_zulu_sec,
+        paused             = bool(fdr_paused),
+        aircraft           = AIRCRAFT_FILENAME,
+        -- DSR metadata: urgency, rate, and interval used for this snapshot
+        urgency_score      = urgency,
+        sample_interval_s  = interval_used,
+        sample_rate_hz     = 1.0 / interval_used,
 
         position = {
             lat_deg         = fdr_lat,
@@ -783,14 +883,13 @@ end
 -- Main recording function — pcall-protected
 -- ================================================================
 function fdr_record()
-    local sim_t = TOTAL_RUNNING_TIME_SEC
-    -- Critical phase: low altitude (< 300 ft RA) AND moving (> 40 kts IAS)
-    local in_critical = (fdr_ra_ft < 300 and fdr_ias > 40)
-    local interval    = in_critical and INTERVAL_CRITICAL or INTERVAL_NORMAL
+    local sim_t   = os.clock()
+    local urgency = urgency_score()
+    local interval = score_to_interval(urgency)
     if sim_t - last_write_time < interval then return end
     last_write_time = sim_t
 
-    local ok, result = pcall(build_snapshot, os.time(), in_critical)
+    local ok, result = pcall(build_snapshot, os.time(), urgency, interval)
     if not ok then
         print("[FDR] snapshot error: " .. tostring(result))
         return
